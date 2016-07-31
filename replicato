@@ -1,0 +1,338 @@
+#!/bin/sh
+
+# The Replicato backup system.
+#
+#   Copyright (c) 2016 by Mike Joseph <mj@doze.net>
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+
+# INSTALLATION NOTES:
+#   This script can be installed directly into /usr/local/bin, or anywhere
+#   else that the system administrator desires.  On a normal debian system,
+#   the only additional packages required are 'rsync' and 'attr'. 
+#   Everything else is flagged essential.
+#
+# OPERATION NOTES:
+#   This script can (and in most cases, should) be run by a normal
+#   non-privileged user.  Use the '-h' option to get more details about its
+#   exact syntax.
+
+
+EMPTY_DIR='.empty'
+SYNC_DIR='.sync'
+CURRENT_DIR='current'
+TARGET_FILE='target'
+INTERVALS_FILE='intervals'
+PATHS_FILE='paths'
+PATHFILE_FILE='pathfile'
+TIMESTAMP_ATTR='user.replicato.timestamp'
+RSYNC_BASE_OPTS='-azSHAXxrs --ignore-existing'
+RSYNC_FUZZY_OPTS='-yy'
+USAGE_STR='[OPTIONS] <backup directory>'
+
+set -e
+
+syntax() {
+  echo "Usage: $0 $USAGE_STR" >&2
+  echo "       $0 -h" >&2
+  exit 1
+}
+
+usage() {
+  echo "Usage: $0 $USAGE_STR" >&2
+  echo >&2
+  echo "Options:" >&2
+  echo "  -v   Verbose (show commands to be executed)" >&2
+  echo "  -n   Dry-run (do not actually execute commands)" >&2
+  echo "  -c   Check directory integrity" >&2
+  echo "  -b   Perform backup and rotations" >&2
+  echo "  -r   Print report of disk usage and backup snapshots" >&2
+  echo "  -h   Display this help information" >&2
+  echo >&2
+  exit 1
+}
+
+warn() {
+  echo "$0: $1" >&2
+}
+
+die() {
+  warn "$1"
+  exit 2
+}
+
+cmd() {
+  [ "$FLAG_v" ] && echo "[CMD] $*" >&2
+  [ "$FLAG_n" ] || "$@"
+}
+
+cleanup_dir() {
+  local dir="$1"
+  
+  warn "Cleaning up stale directory '$dir'..."
+  cmd rm -rf "$dir"
+}
+
+set_timestamp() {
+  local dir="$1"
+  
+  cmd setfattr --name="$TIMESTAMP_ATTR" --value="$( date -R )" "$dir"
+}
+
+get_timestamp() {
+  local dir="$1"
+  local ts_attr="$( getfattr --name=$TIMESTAMP_ATTR --only-values $dir )"
+  
+  [ "$ts_attr" ] \
+      || die "No valid backup timestamp found for '$dir'"
+  date --date="$ts_attr" '+%s'
+}
+
+get_dir_bytes() {
+  local dir="$1"
+  
+  du -sb "$dir" | if read size dir ; then
+    echo "$size"
+  else
+    die "Could not get disk usage of '$dir'"
+  fi
+}
+
+read_intervals() {
+  [ -e "$INTERVALS_FILE" ] && cat "$INTERVALS_FILE"
+}
+
+validate_files() {
+  local fname
+  
+  ls -1 \
+      | ( enumerate_backups | grep -vxFf - /dev/fd/3 ) 3<&0 \
+      | while read fname ; do
+    [ "$fname" = "$TARGET_FILE" ] && continue
+    [ "$fname" = "$INTERVALS_FILE" ] && continue
+    [ "$fname" = "$PATHS_FILE" ] && continue
+    [ "$fname" = "$PATHFILE_FILE" ] && continue
+    [ "$fname" = "$CURRENT_DIR" ] && continue
+    
+    if [ "$fname" = "$SYNC_DIR" ] || [ "$fname" = "$EMPTY_DIR" ] ; then
+      warn "Stale working directory '$fname' exists..."
+    else
+      warn "Unknown file or directory '$fname' found..."
+    fi
+  done
+}
+
+validate_intervals() {
+  local interval delay count
+  
+  read_intervals | while read interval delay count ; do
+    case "$interval" in
+      *[!a-zA-Z0-9_]*) \
+          die "Interval name '$interval' is invalid" ;;
+    esac
+    case "$delay" in
+      *[!0-9]*) \
+          die "Delay value '$delay' for interval '$interval' is invalid" ;;
+    esac
+    case "$count" in
+      *[!0-9]*) \
+          die "Count value '$count' for interval '$interval' is invalid" ;;
+    esac
+    
+    [ "$delay" -gt 0 ] \
+        || die "Delay value '$delay' for interval '$interval' is invalid"
+    [ "$count" -gt 0 ] \
+        || die "Count value '$count' for interval '$interval' is invalid"
+  done
+}
+
+get_rsync_version() {
+  local word_rsync word_version rsync_version rest
+  rsync --version | if read word_rsync word_version rsync_version rest ; then
+    if [ "$word_rsync $word_version" = 'rsync version' ] \
+        && [ "$rsync_version" ] ; then
+      echo "$rsync_version"
+    else
+      die 'Could not parse rsync version string'
+    fi
+  else
+    die 'Failed to execute rsync during version test'
+  fi
+}
+
+get_rsync_opts() {
+  local rsync_version="$( get_rsync_version )"
+  local rsync_opts="$RSYNC_BASE_OPTS"
+  
+  # Eventually, we'll add a case to detect a recent-enough rsync version and
+  # will conditionally include $RSYNC_FUZZY_OPTS accordingly.
+  
+  echo "$rsync_opts"
+}
+
+perform_rsync() {
+  local rsync_opts="$1"
+  local target
+  local filesfrom
+  local fakesuper
+  local linkdest="$( readlink -e $CURRENT_DIR || readlink -m $EMPTY_DIR )"
+
+  [ -e "$SYNC_DIR" ] && cleanup_dir "$SYNC_DIR"
+  [ -e "$EMPTY_DIR" ] && cleanup_dir "$EMPTY_DIR"
+  
+  if [ -e "$TARGET_FILE" ] ; then
+    read target < "$TARGET_FILE"
+    fakesuper='--fake-super'
+  else
+    fakesuper='-M--fake-super'
+  fi
+  
+  if [ -e "$PATHS_FILE" ] ; then
+    filesfrom="$PATHS_FILE"
+  elif [ -e "$PATHFILE_FILE" ] ; then
+    read filesfrom < "$PATHFILE_FILE"
+    filesfrom="${target:+:}$filesfrom"
+  fi
+  
+  cmd mkdir "$SYNC_DIR" "$EMPTY_DIR"
+
+  cmd rsync $rsync_opts \
+      "$fakesuper" \
+      --link-dest="$linkdest" \
+      --files-from="$filesfrom" \
+      "${target:+$target:}/" \
+      "$SYNC_DIR"
+  set_timestamp "$SYNC_DIR"
+  
+  cmd rmdir "$EMPTY_DIR"
+}
+
+rotate_backup() {
+  local interval="$1"
+  local count="$2"
+  local index="$3"
+  local next="$(( $index + 1 ))"
+  
+  if [ "$next" -lt "$count" ] ; then
+    [ -e "$interval.$next" ] && rotate_backup "$interval" "$count" "$next"
+    cmd mv -nT "$interval.$index" "$interval.$next"
+  elif [ "$next" -eq "$count" ] ; then
+    promote_backup "$interval.$index"
+  else
+    die "Index $index out of bounds for interval '$interval'"
+  fi
+}
+
+promote_backup() {
+  local src="$1"
+  local interval delay count
+  local dst new_ts old_ts
+  
+  
+  if [ -e "$src" ] ; then
+    if read interval delay count ; then
+      dst="$interval.0"
+      
+      if [ -e "$dst" ] ; then
+        new_ts="$( get_timestamp $src )"
+        old_ts="$( get_timestamp $dst )"
+        
+        if [ "$(( $new_ts - $old_ts ))" -ge "$delay" ] ; then
+          rotate_backup "$interval" "$count" 0
+        else
+          dst=""
+        fi
+      fi
+      
+      [ "$dst" ] && cmd mv -nT "$src" "$dst"
+    fi
+    
+    cmd rm -rf "$src"
+  fi
+}
+
+enumerate_backups() {
+  local interval delay count
+  
+  echo "$CURRENT_DIR"
+  read_intervals | while read interval delay count ; do
+    seq --format="$interval.%g" 0 "$(( $count - 1 ))"
+  done
+}
+
+generate_report() {
+  local dir size timestamp
+  local current total
+  
+  echo
+  echo -n 'Snapshots present:'
+  ls -1 \
+      | ( enumerate_backups | grep -xFf /dev/fd/3 ) 3<&0 \
+      | xargs -x du -sh \
+      | while read size dir ; do
+    if [ "$dir" = '.' ] ; then
+      echo ' No backups found.'
+    else
+      timestamp="$( getfattr --name=$TIMESTAMP_ATTR --only-values $dir )"
+      printf '\n%5s%-15s %10s%10s%s' '' "$dir" "$size" '' "$timestamp"
+    fi
+  done
+
+  if [ -e "$CURRENT_DIR" ] ; then
+    current="$( get_dir_bytes $CURRENT_DIR )"
+    total="$( get_dir_bytes . )"
+  fi
+  
+  du -sh | if read size dir ; then
+    printf '\n\n%-20s %10s' "Total disk usage:" "$size"
+    if [ "$current" -a "$total" ] ; then
+      printf '%10s(%d%% efficiency)' '' "$(( ( $current * 100 ) / $total ))"
+    fi
+    printf '\n\n'
+  else
+    die "Could not get disk usage of '$PWD'"
+  fi
+}
+
+run_backup() {
+  perform_rsync "$( get_rsync_opts )"
+  read_intervals | promote_backup "$CURRENT_DIR"
+  cmd mv -nT "$SYNC_DIR" "$CURRENT_DIR"
+}
+
+main() {
+  [ -e "$PATHS_FILE" -a -e "$PATHFILE_FILE" ] \
+      && die "Only one of '$PATHS_FILE' or '$PATHFILE_FILE' may be present"
+  [ -e "$PATHS_FILE" -o -e "$PATHFILE_FILE" ] \
+      || die "One of '$PATHS_FILE' or '$PATHFILE_FILE' must be present"
+  
+  validate_intervals
+  
+  [ "$FLAG_c" ] && validate_files
+  [ "$FLAG_b" ] && run_backup
+  [ "$FLAG_r" ] && generate_report
+}
+
+while getopts 'vncbrh' opt ; do
+  case "$opt" in
+    v|n|c|b|r) eval "FLAG_$opt=1" ;;
+    h) usage ;;
+    *) syntax ;;
+  esac
+done
+shift "$(( $OPTIND - 1 ))"
+
+[ $# -eq 1 ] || syntax
+cd "$1"
+
+( flock -xn 3 || die "Could not obtain lock" ; main ) 3< .
